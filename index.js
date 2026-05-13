@@ -36,7 +36,7 @@ const client = new Client({
 
 const TOKEN = process.env.BOT_TOKEN;
 const DOWNLOAD_API = 'https://eypz.koyeb.app/api/dl?q=';
-const PLAYLIST_API = 'https://eypz.koyeb.app/api/playlist?url=';
+const PLAYLIST_API  = 'https://eypz.koyeb.app/api/playlist?url=';
 
 const queues = new Map();
 
@@ -129,6 +129,19 @@ async function fetchTrackData(query) {
     }
 }
 
+// Download the audio URL as a readable stream and pipe into discord
+async function fetchAudioStream(url) {
+    const res = await axios.get(url, {
+        responseType: 'stream',
+        timeout: 30000,
+        headers: {
+            'User-Agent': 'Mozilla/5.0',
+            'Range': 'bytes=0-'
+        }
+    });
+    return res.data; // this is a Node.js Readable stream
+}
+
 async function playNext(guildId) {
     const queue = queues.get(guildId);
     if (!queue || queue.songs.length === 0) {
@@ -147,16 +160,27 @@ async function playNext(guildId) {
         return playNext(guildId);
     }
 
-    // StreamType.Arbitrary tells ffmpeg to download + decode the URL on the fly
-    // This is required when the URL is a direct download, not a live stream
-    const resource = createAudioResource(trackData.url, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true
-    });
-    resource.volume.setVolume(queue.volume);
+    // Log the URL so you can verify what's being fetched
+    console.log('Playing URL:', trackData.url);
+
+    let resource;
+    try {
+        // Pipe the download stream directly — works even without ffmpeg installed globally
+        const audioStream = await fetchAudioStream(trackData.url);
+        resource = createAudioResource(audioStream, {
+            inputType: StreamType.Arbitrary,
+            inlineVolume: true
+        });
+        resource.volume.setVolume(queue.volume);
+    } catch (err) {
+        console.error('Audio stream error:', err.message);
+        queue.songs.shift();
+        return playNext(guildId);
+    }
+
     queue.player.play(resource);
 
-    // Delete old embed so playlist doesn't spam a new message every song
+    // Delete old embed (no playlist spam)
     if (queue.nowPlayingMsg) {
         try { await queue.nowPlayingMsg.delete(); } catch (_) {}
         queue.nowPlayingMsg = null;
@@ -197,7 +221,7 @@ async function playNext(guildId) {
         console.error('Failed to send embed:', err);
     }
 
-    // Pre-fetch next track 30s before current ends for gapless playback
+    // Pre-fetch next track 30s before end
     if (durationSec > 35 && queue.songs.length > 1) {
         setTimeout(async () => {
             const q = queues.get(guildId);

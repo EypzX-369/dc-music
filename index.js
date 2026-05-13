@@ -1,5 +1,16 @@
 require('dotenv').config();
 
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+    res.send('Bot Running');
+});
+
+app.listen(process.env.PORT || 3000, () => {
+    console.log('Web server started');
+});
+
 const {
     Client,
     GatewayIntentBits,
@@ -21,7 +32,7 @@ const ffmpeg = require('ffmpeg-static');
 const axios = require('axios');
 const { spawn } = require('child_process');
 
-const PREFIX = '.';
+const PREFIX = '/';
 
 const client = new Client({
     intents: [
@@ -101,30 +112,84 @@ async function playNext(guildId) {
     }
 }
 
+async function createQueue(message, voiceChannel) {
+    const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: voiceChannel.guild.id,
+        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf: false
+    });
+
+    try {
+        await entersState(
+            connection,
+            VoiceConnectionStatus.Ready,
+            15000
+        );
+    } catch (err) {
+        console.log('Voice connection timeout');
+
+        connection.destroy();
+
+        message.reply('Failed to join voice channel');
+
+        return null;
+    }
+
+    const player = createAudioPlayer();
+
+    connection.subscribe(player);
+
+    const queue = {
+        textChannel: message.channel,
+        voiceChannel,
+        connection,
+        player,
+        songs: []
+    };
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        playNext(message.guild.id);
+    });
+
+    player.on('error', (err) => {
+        console.error(err);
+        playNext(message.guild.id);
+    });
+
+    queues.set(message.guild.id, queue);
+
+    return queue;
+}
+
 client.on('messageCreate', async (message) => {
     try {
         if (message.author.bot) return;
         if (!message.content.startsWith(PREFIX)) return;
 
-        const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+        const args = message.content
+            .slice(PREFIX.length)
+            .trim()
+            .split(/ +/);
+
         const command = args.shift()?.toLowerCase();
 
         if (command === 'play') {
             const query = args.join(' ');
 
             if (!query) {
-                return message.reply('Provide a song name');
+                return message.reply('Provide song name');
             }
 
             const voiceChannel = message.member.voice.channel;
 
             if (!voiceChannel) {
-                return message.reply('Join a voice channel first');
+                return message.reply('Join voice channel first');
             }
 
-            const msg = await message.reply('Searching...');
+            const msg = await message.reply('Searching song...');
 
-            const api = `https://song-dl-0q80.onrender.com/api/dl?q=${encodeURIComponent(query)}`;
+            const api = `https://eypz.koyeb.app/api/dl?q=${encodeURIComponent(query)}`;
 
             const { data } = await axios.get(api);
 
@@ -137,41 +202,9 @@ client.on('messageCreate', async (message) => {
             let queue = queues.get(message.guild.id);
 
             if (!queue) {
-                const connection = joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: voiceChannel.guild.id,
-                    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-                    selfDeaf: false
-                });
+                queue = await createQueue(message, voiceChannel);
 
-                await entersState(
-                    connection,
-                    VoiceConnectionStatus.Ready,
-                    30000
-                );
-
-                const player = createAudioPlayer();
-
-                connection.subscribe(player);
-
-                queue = {
-                    textChannel: message.channel,
-                    voiceChannel,
-                    connection,
-                    player,
-                    songs: []
-                };
-
-                queues.set(message.guild.id, queue);
-
-                player.on(AudioPlayerStatus.Idle, () => {
-                    playNext(message.guild.id);
-                });
-
-                player.on('error', (err) => {
-                    console.error(err);
-                    playNext(message.guild.id);
-                });
+                if (!queue) return;
             }
 
             queue.songs.push({
@@ -180,9 +213,12 @@ client.on('messageCreate', async (message) => {
                 thumbnail: song.thumbnail
             });
 
-            msg.edit(`Added to queue: ${song.title}`);
+            await msg.edit(`Added to queue: ${song.title}`);
 
-            if (queue.player.state.status !== AudioPlayerStatus.Playing) {
+            if (
+                queue.player.state.status !==
+                AudioPlayerStatus.Playing
+            ) {
                 playNext(message.guild.id);
             }
         }
@@ -191,22 +227,32 @@ client.on('messageCreate', async (message) => {
             const url = args[0];
 
             if (!url) {
-                return message.reply('Provide Spotify playlist URL');
+                return message.reply(
+                    'Provide Spotify playlist URL'
+                );
             }
 
             const voiceChannel = message.member.voice.channel;
 
             if (!voiceChannel) {
-                return message.reply('Join a voice channel first');
+                return message.reply(
+                    'Join voice channel first'
+                );
             }
 
-            const msg = await message.reply('Fetching playlist...');
+            const msg = await message.reply(
+                'Fetching playlist...'
+            );
 
-            const api = `https://song-dl-0q80.onrender.com/api/playlist?url=${encodeURIComponent(url)}`;
+            const api =
+                `https://song-dl-0q80.onrender.com/api/playlist?url=${encodeURIComponent(url)}`;
 
             const { data } = await axios.get(api);
 
-            if (!data?.status || !data?.result?.tracks?.length) {
+            if (
+                !data?.status ||
+                !data?.result?.tracks?.length
+            ) {
                 return msg.edit('Playlist not found');
             }
 
@@ -215,51 +261,25 @@ client.on('messageCreate', async (message) => {
             let queue = queues.get(message.guild.id);
 
             if (!queue) {
-                const connection = joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: voiceChannel.guild.id,
-                    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-                    selfDeaf: false
-                });
-
-                await entersState(
-                    connection,
-                    VoiceConnectionStatus.Ready,
-                    30000
+                queue = await createQueue(
+                    message,
+                    voiceChannel
                 );
 
-                const player = createAudioPlayer();
-
-                connection.subscribe(player);
-
-                queue = {
-                    textChannel: message.channel,
-                    voiceChannel,
-                    connection,
-                    player,
-                    songs: []
-                };
-
-                queues.set(message.guild.id, queue);
-
-                player.on(AudioPlayerStatus.Idle, () => {
-                    playNext(message.guild.id);
-                });
-
-                player.on('error', (err) => {
-                    console.error(err);
-                    playNext(message.guild.id);
-                });
+                if (!queue) return;
             }
 
-            msg.edit(`Adding ${playlist.tracks.length} songs...`);
+            await msg.edit(
+                `Adding ${playlist.tracks.length} songs...`
+            );
 
             for (const track of playlist.tracks) {
                 try {
-                    const search = `${track.name} ${track.artist}`;
+                    const search =
+                        `${track.name} ${track.artist}`;
 
                     const dl = await axios.get(
-                        `https://eypz.koyeb.app/api/dl?q=${encodeURIComponent(search)}`
+                        `https://song-dl-0q80.onrender.com/api/dl?q=${encodeURIComponent(search)}`
                     );
 
                     if (
@@ -269,20 +289,24 @@ client.on('messageCreate', async (message) => {
                         queue.songs.push({
                             title: dl.data.result.title,
                             url: dl.data.result.url,
-                            thumbnail: dl.data.result.thumbnail
+                            thumbnail:
+                                dl.data.result.thumbnail
                         });
                     }
 
-                } catch (e) {
-                    console.log(e);
+                } catch (err) {
+                    console.log(err);
                 }
             }
 
-            msg.edit(
+            await msg.edit(
                 `Playlist Added\nName: ${playlist.info.name}\nTracks: ${playlist.tracks.length}`
             );
 
-            if (queue.player.state.status !== AudioPlayerStatus.Playing) {
+            if (
+                queue.player.state.status !==
+                AudioPlayerStatus.Playing
+            ) {
                 playNext(message.guild.id);
             }
         }
@@ -302,23 +326,36 @@ client.on('messageCreate', async (message) => {
         else if (command === 'queue') {
             const queue = queues.get(message.guild.id);
 
-            if (!queue || queue.songs.length === 0) {
+            if (
+                !queue ||
+                queue.songs.length === 0
+            ) {
                 return message.reply('Queue empty');
             }
 
             const songs = queue.songs
-                .slice(0, 10)
-                .map((s, i) => `${i + 1}. ${s.title}`)
+                .slice(0, 15)
+                .map((s, i) =>
+                    `${i + 1}. ${s.title}`
+                )
                 .join('\n');
 
-            message.reply(songs);
+            const embed = new EmbedBuilder()
+                .setTitle('Queue')
+                .setDescription(songs);
+
+            message.reply({
+                embeds: [embed]
+            });
         }
 
         else if (command === 'stop') {
             const queue = queues.get(message.guild.id);
 
             if (!queue) {
-                return message.reply('Nothing playing');
+                return message.reply(
+                    'Nothing playing'
+                );
             }
 
             queue.songs = [];
@@ -332,7 +369,12 @@ client.on('messageCreate', async (message) => {
             message.reply('Stopped');
         }
 
-    } catch (err) {
+        else if (command === 'ping') {
+            message.reply('Pong');
+        }
+    }
+
+    catch (err) {
         console.error(err);
 
         try {

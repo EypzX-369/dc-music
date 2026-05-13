@@ -53,8 +53,13 @@ client.once('ready', async () => {
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.content) return;
+
     const query = message.content.trim();
+
+    // Ignore mentions, commands, very short messages
+    if (query.startsWith('<@') || query.startsWith('/') || query.startsWith('!')) return;
     if (!query.startsWith('http') && query.length <= 3) return;
+
     handlePlayRequest(message, query);
 });
 
@@ -72,7 +77,6 @@ async function handlePlayRequest(message, query) {
             player: createAudioPlayer(),
             songs: [],
             volume: 0.5,
-            prefetchedNext: null,
             nowPlayingMsg: null
         };
         queues.set(message.guild.id, queue);
@@ -82,18 +86,20 @@ async function handlePlayRequest(message, query) {
     try {
         if (query.includes('spotify.com/playlist/')) {
             const loadingMsg = await message.channel.send('⏳ Loading playlist...');
-            const res = await axios.get(`${PLAYLIST_API}${encodeURIComponent(query)}`);
+            const res = await axios.get(`${PLAYLIST_API}${encodeURIComponent(query)}`, { timeout: 20000 });
             const tracks = res.data?.result?.tracks;
             if (!tracks || tracks.length === 0) return loadingMsg.edit('❌ Could not load playlist.');
             for (const t of tracks) {
-                queue.songs.push({ title: `${t.name} ${t.artist}`, url: t.share_url || `${t.name} ${t.artist}` });
+                // Store search title — we fetch fresh URL right before playing
+                queue.songs.push({ title: `${t.name} ${t.artist}` });
             }
             await loadingMsg.edit({
                 content: null,
                 embeds: [new EmbedBuilder().setDescription(`✅ Added **${tracks.length} tracks** to the queue.`).setColor('#1DB954')]
             });
         } else {
-            queue.songs.push({ title: query, url: query });
+            // Store query as title — fresh URL fetched at play time
+            queue.songs.push({ title: query });
             if (queue.connection && queue.songs.length > 1) {
                 await message.channel.send({
                     embeds: [new EmbedBuilder().setDescription(`🎵 Added to queue: \`${query}\``).setColor('#0099FF')]
@@ -119,27 +125,33 @@ async function handlePlayRequest(message, query) {
     }
 }
 
-async function fetchTrackData(query) {
+// Always fetch a fresh track URL right before playing — download links expire
+async function fetchTrackData(title) {
     try {
-        const res = await axios.get(`${DOWNLOAD_API}${encodeURIComponent(query)}`, { timeout: 15000 });
-        return res.data?.status ? res.data.result : null;
+        console.log('Fetching track:', title);
+        const res = await axios.get(`${DOWNLOAD_API}${encodeURIComponent(title)}`, { timeout: 20000 });
+        if (!res.data?.status || !res.data?.result?.url) {
+            console.warn('No result for:', title);
+            return null;
+        }
+        console.log('Got URL:', res.data.result.url);
+        return res.data.result;
     } catch (err) {
         console.error('fetchTrackData error:', err.message);
         return null;
     }
 }
 
-// Download the audio URL as a readable stream and pipe into discord
 async function fetchAudioStream(url) {
     const res = await axios.get(url, {
         responseType: 'stream',
         timeout: 30000,
         headers: {
-            'User-Agent': 'Mozilla/5.0',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Range': 'bytes=0-'
         }
     });
-    return res.data; // this is a Node.js Readable stream
+    return res.data;
 }
 
 async function playNext(guildId) {
@@ -151,21 +163,18 @@ async function playNext(guildId) {
     }
 
     const song = queue.songs[0];
-    let trackData = queue.prefetchedNext || await fetchTrackData(song.url || song.title);
-    queue.prefetchedNext = null;
+
+    // Always fetch a fresh URL right now — never cache audio URLs since they expire
+    const trackData = await fetchTrackData(song.title);
 
     if (!trackData) {
-        console.warn('No track data for:', song.title);
+        console.warn('Skipping, no track data:', song.title);
         queue.songs.shift();
         return playNext(guildId);
     }
 
-    // Log the URL so you can verify what's being fetched
-    console.log('Playing URL:', trackData.url);
-
     let resource;
     try {
-        // Pipe the download stream directly — works even without ffmpeg installed globally
         const audioStream = await fetchAudioStream(trackData.url);
         resource = createAudioResource(audioStream, {
             inputType: StreamType.Arbitrary,
@@ -173,14 +182,14 @@ async function playNext(guildId) {
         });
         resource.volume.setVolume(queue.volume);
     } catch (err) {
-        console.error('Audio stream error:', err.message);
+        console.error('Stream error for', song.title, ':', err.message);
         queue.songs.shift();
         return playNext(guildId);
     }
 
     queue.player.play(resource);
 
-    // Delete old embed (no playlist spam)
+    // Delete old embed (prevents playlist spam)
     if (queue.nowPlayingMsg) {
         try { await queue.nowPlayingMsg.delete(); } catch (_) {}
         queue.nowPlayingMsg = null;
@@ -219,16 +228,6 @@ async function playNext(guildId) {
         setupCollector(msg, queue, guildId);
     } catch (err) {
         console.error('Failed to send embed:', err);
-    }
-
-    // Pre-fetch next track 30s before end
-    if (durationSec > 35 && queue.songs.length > 1) {
-        setTimeout(async () => {
-            const q = queues.get(guildId);
-            if (q && q.songs.length > 1) {
-                q.prefetchedNext = await fetchTrackData(q.songs[1].url || q.songs[1].title);
-            }
-        }, (durationSec - 30) * 1000);
     }
 }
 

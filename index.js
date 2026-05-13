@@ -22,7 +22,9 @@ const {
     createAudioPlayer,
     createAudioResource,
     AudioPlayerStatus,
-    StreamType
+    StreamType,
+    VoiceConnectionStatus,
+    entersState
 } = require('@discordjs/voice');
 
 const prism = require('prism-media');
@@ -31,6 +33,8 @@ const axios = require('axios');
 const { spawn } = require('child_process');
 
 const PREFIX = '/';
+
+const API_BASE = 'https://song-dl-0q80.onrender.com';
 
 const client = new Client({
     intents: [
@@ -54,6 +58,7 @@ async function createStream(url) {
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '5',
+        '-nostdin',
         '-i', url,
         '-analyzeduration', '0',
         '-loglevel', '0',
@@ -62,6 +67,7 @@ async function createStream(url) {
         '-ac', '2',
         'pipe:1'
     ], {
+        windowsHide: true,
         stdio: ['ignore', 'pipe', 'ignore']
     });
 
@@ -86,6 +92,8 @@ async function playNext(guildId) {
     if (!queue) return;
 
     if (queue.songs.length === 0) {
+
+        queue.player.stop();
 
         queue.connection.destroy();
 
@@ -125,7 +133,41 @@ async function createQueue(message, voiceChannel) {
         channelId: voiceChannel.id,
         guildId: voiceChannel.guild.id,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-        selfDeaf: false
+        selfDeaf: true
+    });
+
+    connection.on(
+        VoiceConnectionStatus.Disconnected,
+        async () => {
+
+            try {
+
+                await Promise.race([
+                    entersState(
+                        connection,
+                        VoiceConnectionStatus.Signalling,
+                        5000
+                    ),
+
+                    entersState(
+                        connection,
+                        VoiceConnectionStatus.Connecting,
+                        5000
+                    )
+                ]);
+
+            } catch {
+
+                connection.destroy();
+            }
+        }
+    );
+
+    connection.on('stateChange', (oldState, newState) => {
+
+        console.log(
+            `Voice State: ${oldState.status} -> ${newState.status}`
+        );
     });
 
     const player = createAudioPlayer();
@@ -141,19 +183,15 @@ async function createQueue(message, voiceChannel) {
     };
 
     player.on(AudioPlayerStatus.Idle, () => {
+
         playNext(message.guild.id);
     });
 
     player.on('error', (err) => {
+
         console.log(err);
 
         playNext(message.guild.id);
-    });
-
-    connection.on('stateChange', (oldState, newState) => {
-        console.log(
-            `Voice State: ${oldState.status} -> ${newState.status}`
-        );
     });
 
     queues.set(message.guild.id, queue);
@@ -201,7 +239,7 @@ client.on('messageCreate', async (message) => {
                 );
 
             const api =
-                `https://eypz.koyeb.app/api/dl?q=${encodeURIComponent(query)}`;
+                `${API_BASE}/api/dl?q=${encodeURIComponent(query)}`;
 
             const { data } =
                 await axios.get(api);
@@ -255,6 +293,7 @@ client.on('messageCreate', async (message) => {
             const url = args[0];
 
             if (!url) {
+
                 return message.reply(
                     'Provide Spotify playlist URL'
                 );
@@ -264,6 +303,7 @@ client.on('messageCreate', async (message) => {
                 message.member.voice.channel;
 
             if (!voiceChannel) {
+
                 return message.reply(
                     'Join voice channel first'
                 );
@@ -275,7 +315,7 @@ client.on('messageCreate', async (message) => {
                 );
 
             const api =
-                `https://song-dl-0q80.onrender.com/api/playlist?url=${encodeURIComponent(url)}`;
+                `${API_BASE}/api/playlist?url=${encodeURIComponent(url)}`;
 
             const { data } =
                 await axios.get(api);
@@ -284,6 +324,7 @@ client.on('messageCreate', async (message) => {
                 !data?.status ||
                 !data?.result?.tracks?.length
             ) {
+
                 return msg.edit(
                     'Playlist not found'
                 );
@@ -319,7 +360,7 @@ client.on('messageCreate', async (message) => {
 
                     const dl =
                         await axios.get(
-                            `https://song-dl-0q80.onrender.com/api/dl?q=${encodeURIComponent(search)}`
+                            `${API_BASE}/api/dl?q=${encodeURIComponent(search)}`
                         );
 
                     if (
@@ -330,8 +371,10 @@ client.on('messageCreate', async (message) => {
                         queue.songs.push({
                             title:
                                 dl.data.result.title,
+
                             url:
                                 dl.data.result.url,
+
                             thumbnail:
                                 dl.data.result.thumbnail
                         });
@@ -362,6 +405,7 @@ client.on('messageCreate', async (message) => {
                 queues.get(message.guild.id);
 
             if (!queue) {
+
                 return message.reply(
                     'No queue'
                 );
@@ -381,6 +425,7 @@ client.on('messageCreate', async (message) => {
                 !queue ||
                 queue.songs.length === 0
             ) {
+
                 return message.reply(
                     'Queue empty'
                 );
@@ -410,6 +455,7 @@ client.on('messageCreate', async (message) => {
                 queues.get(message.guild.id);
 
             if (!queue) {
+
                 return message.reply(
                     'Nothing playing'
                 );
@@ -437,9 +483,11 @@ client.on('messageCreate', async (message) => {
         console.log(err);
 
         try {
+
             message.reply(
                 'Error occurred'
             );
+
         } catch {}
     }
 });

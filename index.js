@@ -24,6 +24,15 @@ const client = new Client({
     ]
 });
 
+const http = require('http');
+
+const PORT = process.env.PORT || 10000;
+http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end('Bot is Online');
+}).listen(PORT, () => {
+    console.log(`Keep-alive server running on port ${PORT}`);
+});
 // Settings
 const TOKEN = process.env.BOT_TOKEN;
 const DOWNLOAD_API = 'https://eypz.koyeb.app/api/dl?q=';

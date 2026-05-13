@@ -12,6 +12,8 @@ const {
     createAudioPlayer, 
     createAudioResource, 
     AudioPlayerStatus,
+    VoiceConnectionStatus,
+    entersState,
     StreamType
 } = require('@discordjs/voice');
 const axios = require('axios');
@@ -53,13 +55,9 @@ client.once('ready', async () => {
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.content) return;
-
     const query = message.content.trim();
-
-    // Ignore mentions, commands, very short messages
     if (query.startsWith('<@') || query.startsWith('/') || query.startsWith('!')) return;
     if (!query.startsWith('http') && query.length <= 3) return;
-
     handlePlayRequest(message, query);
 });
 
@@ -90,7 +88,6 @@ async function handlePlayRequest(message, query) {
             const tracks = res.data?.result?.tracks;
             if (!tracks || tracks.length === 0) return loadingMsg.edit('❌ Could not load playlist.');
             for (const t of tracks) {
-                // Store search title — we fetch fresh URL right before playing
                 queue.songs.push({ title: `${t.name} ${t.artist}` });
             }
             await loadingMsg.edit({
@@ -98,7 +95,6 @@ async function handlePlayRequest(message, query) {
                 embeds: [new EmbedBuilder().setDescription(`✅ Added **${tracks.length} tracks** to the queue.`).setColor('#1DB954')]
             });
         } else {
-            // Store query as title — fresh URL fetched at play time
             queue.songs.push({ title: query });
             if (queue.connection && queue.songs.length > 1) {
                 await message.channel.send({
@@ -108,15 +104,38 @@ async function handlePlayRequest(message, query) {
         }
 
         if (!queue.connection) {
-            queue.connection = joinVoiceChannel({
+            const conn = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: message.guild.id,
                 adapterCreator: message.guild.voiceAdapterCreator,
                 selfDeaf: false,
                 selfMute: false
             });
-            queue.connection.subscribe(queue.player);
-            playNext(message.guild.id);
+
+            queue.connection = conn;
+            conn.subscribe(queue.player);
+
+            // Handle unexpected disconnects — try to recover, else clean up
+            conn.on(VoiceConnectionStatus.Disconnected, async () => {
+                try {
+                    await Promise.race([
+                        entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
+                        entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
+                    ]);
+                } catch {
+                    conn.destroy();
+                    queues.delete(message.guild.id);
+                }
+            });
+
+            // Start playback only after connection is Ready — no AbortError, no premature play
+            if (conn.state.status === VoiceConnectionStatus.Ready) {
+                playNext(message.guild.id);
+            } else {
+                conn.once(VoiceConnectionStatus.Ready, () => {
+                    playNext(message.guild.id);
+                });
+            }
         }
 
     } catch (err) {
@@ -125,7 +144,7 @@ async function handlePlayRequest(message, query) {
     }
 }
 
-// Always fetch a fresh track URL right before playing — download links expire
+// Fetch fresh track metadata + URL right before playing (URLs expire quickly)
 async function fetchTrackData(title) {
     try {
         console.log('Fetching track:', title);
@@ -142,6 +161,7 @@ async function fetchTrackData(title) {
     }
 }
 
+// Pipe download as stream with full browser headers (server blocks non-browser requests)
 async function fetchAudioStream(url) {
     const res = await axios.get(url, {
         responseType: 'stream',
@@ -169,8 +189,6 @@ async function playNext(guildId) {
     }
 
     const song = queue.songs[0];
-
-    // Always fetch a fresh URL right now — never cache audio URLs since they expire
     const trackData = await fetchTrackData(song.title);
 
     if (!trackData) {

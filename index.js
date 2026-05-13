@@ -13,8 +13,7 @@ const {
     createAudioResource, 
     AudioPlayerStatus,
     VoiceConnectionStatus,
-    entersState,
-    StreamType
+    entersState
 } = require('@discordjs/voice');
 const axios = require('axios');
 const http = require('http');
@@ -59,12 +58,8 @@ client.once('ready', async () => {
 // --- MESSAGE HANDLER ---
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.content) return;
-
     const query = message.content.trim();
-
-    // Ignore very short messages that aren't URLs (avoid reacting to every chat message)
     if (!query.startsWith('http') && query.length <= 3) return;
-
     handlePlayRequest(message, query);
 });
 
@@ -113,12 +108,10 @@ async function handlePlayRequest(message, query) {
                         .setColor('#1DB954')
                 ]
             });
-
         } else {
-            // Single track — just push, don't send embed here (playNext will)
             queue.songs.push({ title: query, url: query });
+            // Only show "added to queue" if something is already playing
             if (queue.connection && queue.songs.length > 1) {
-                // Already playing something — confirm queued
                 await message.channel.send({
                     embeds: [
                         new EmbedBuilder()
@@ -131,7 +124,7 @@ async function handlePlayRequest(message, query) {
 
         // --- Connect if not already connected ---
         if (!queue.connection) {
-            queue.connection = joinVoiceChannel({
+            const conn = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: message.guild.id,
                 adapterCreator: message.guild.voiceAdapterCreator,
@@ -139,24 +132,32 @@ async function handlePlayRequest(message, query) {
                 selfMute: false
             });
 
-            // If already Ready (joined instantly), skip entersState entirely
-            if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
-                try {
-                    await entersState(queue.connection, VoiceConnectionStatus.Ready, 30_000);
-                } catch (err) {
-                    console.error('Voice connection error:', err);
-                    // Only destroy if still not ready — sometimes it joins fine despite the timeout
-                    if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
-                        queue.connection.destroy();
-                        queues.delete(message.guild.id);
-                        message.channel.send('❌ Could not connect to voice channel.');
-                        return;
-                    }
-                }
-            }
+            queue.connection = conn;
+            conn.subscribe(queue.player);
 
-            queue.connection.subscribe(queue.player);
-            await playNext(message.guild.id);
+            // Handle disconnects: try to recover briefly, else clean up
+            conn.on(VoiceConnectionStatus.Disconnected, async () => {
+                try {
+                    await Promise.race([
+                        entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
+                        entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
+                    ]);
+                    // Recovered — let it continue
+                } catch {
+                    conn.destroy();
+                    queues.delete(message.guild.id);
+                }
+            });
+
+            // Start playback via event — no blocking entersState, no AbortError
+            if (conn.state.status === VoiceConnectionStatus.Ready) {
+                // Already ready (rare but possible)
+                await playNext(message.guild.id);
+            } else {
+                conn.once(VoiceConnectionStatus.Ready, async () => {
+                    await playNext(message.guild.id);
+                });
+            }
         }
 
     } catch (error) {
@@ -180,16 +181,12 @@ async function fetchTrackData(query) {
 async function playNext(guildId) {
     const queue = queues.get(guildId);
     if (!queue || queue.songs.length === 0) {
-        if (queue?.connection) {
-            queue.connection.destroy();
-        }
+        if (queue?.connection) queue.connection.destroy();
         queues.delete(guildId);
         return;
     }
 
     const song = queue.songs[0];
-
-    // Use prefetched data if available, otherwise fetch now
     let trackData = queue.prefetchedNext || await fetchTrackData(song.url || song.title);
     queue.prefetchedNext = null;
 
@@ -199,14 +196,9 @@ async function playNext(guildId) {
         return playNext(guildId);
     }
 
-    // FIX: Use StreamType.Arbitrary with ffmpeg OR let discord.js auto-handle
-    // Removed explicit StreamType to let the library probe and decode automatically
     let resource;
     try {
-        resource = createAudioResource(trackData.url, {
-            inlineVolume: true,
-            // No inputType — let @discordjs/voice auto-detect (works with most direct URLs)
-        });
+        resource = createAudioResource(trackData.url, { inlineVolume: true });
         resource.volume.setVolume(queue.volume);
     } catch (err) {
         console.error('createAudioResource error:', err);
@@ -216,13 +208,13 @@ async function playNext(guildId) {
 
     queue.player.play(resource);
 
-    // --- Delete old now-playing message to avoid embed spam ---
+    // Delete previous now-playing embed (prevents playlist spam)
     if (queue.nowPlayingMsg) {
         try { await queue.nowPlayingMsg.delete(); } catch (_) {}
         queue.nowPlayingMsg = null;
     }
 
-    // --- Build embed ---
+    // Build now-playing embed
     const durationSec = Math.floor(trackData.duration || 0);
     const durationStr = durationSec > 0
         ? `${Math.floor(durationSec / 60)}:${String(durationSec % 60).padStart(2, '0')}`
@@ -234,7 +226,7 @@ async function playNext(guildId) {
         .setColor('#0099FF')
         .addFields(
             { name: '⏱ Duration', value: durationStr, inline: true },
-            { name: '📋 Queue', value: `${queue.songs.length} track(s)`, inline: true }
+            { name: '📋 Queue',    value: `${queue.songs.length} track(s)`, inline: true }
         );
 
     if (trackData.thumbnail) embed.setThumbnail(trackData.thumbnail);
@@ -252,20 +244,17 @@ async function playNext(guildId) {
         queue.nowPlayingMsg = msg;
         setupCollector(msg, queue, guildId);
     } catch (err) {
-        console.error('Failed to send now-playing embed:', err);
+        console.error('Failed to send embed:', err);
     }
 
-    // --- Gapless pre-fetch: 30s before end ---
+    // Gapless pre-fetch: start fetching next track 30s before end
     if (durationSec > 35 && queue.songs.length > 1) {
-        const delay = (durationSec - 30) * 1000;
         setTimeout(async () => {
-            const currentQueue = queues.get(guildId);
-            if (currentQueue && currentQueue.songs.length > 1) {
-                currentQueue.prefetchedNext = await fetchTrackData(
-                    currentQueue.songs[1].url || currentQueue.songs[1].title
-                );
+            const q = queues.get(guildId);
+            if (q && q.songs.length > 1) {
+                q.prefetchedNext = await fetchTrackData(q.songs[1].url || q.songs[1].title);
             }
-        }, delay);
+        }, (durationSec - 30) * 1000);
     }
 }
 
@@ -287,7 +276,7 @@ function setupPlayerListeners(queue, guildId) {
 function setupCollector(message, queue, guildId) {
     const collector = message.createMessageComponentCollector({
         componentType: ComponentType.Button,
-        time: 600_000 // 10 minutes
+        time: 600_000
     });
 
     collector.on('collect', async (i) => {
@@ -305,7 +294,7 @@ function setupCollector(message, queue, guildId) {
                 break;
 
             case 'skip':
-                queue.player.stop(); // triggers Idle → playNext
+                queue.player.stop();
                 await i.editReply('⏭ Skipped.');
                 break;
 
@@ -333,7 +322,6 @@ function setupCollector(message, queue, guildId) {
     });
 
     collector.on('end', () => {
-        // Disable buttons when collector expires
         message.edit({ components: [] }).catch(() => {});
     });
 }

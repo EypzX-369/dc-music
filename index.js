@@ -1,31 +1,27 @@
-const { 
-    Client, 
-    GatewayIntentBits, 
-    EmbedBuilder, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
-    ButtonStyle, 
-    ComponentType 
-} = require('discord.js');
-const { 
-    joinVoiceChannel, 
-    createAudioPlayer, 
-    createAudioResource, 
-    AudioPlayerStatus,
-    VoiceConnectionStatus,
-    entersState,
-    StreamType
-} = require('@discordjs/voice');
-const axios = require('axios');
-const http = require('http');
 require('dotenv').config();
 
-// --- KEEP-ALIVE ---
-const PORT = process.env.PORT || 10000;
-http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end('Bot is Online');
-}).listen(PORT, () => console.log(`Keep-alive on port ${PORT}`));
+const {
+    Client,
+    GatewayIntentBits,
+    EmbedBuilder
+} = require('discord.js');
+
+const {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    StreamType,
+    entersState,
+    VoiceConnectionStatus
+} = require('@discordjs/voice');
+
+const prism = require('prism-media');
+const ffmpeg = require('ffmpeg-static');
+const axios = require('axios');
+const { spawn } = require('child_process');
+
+const PREFIX = '.';
 
 const client = new Client({
     intents: [
@@ -36,287 +32,313 @@ const client = new Client({
     ]
 });
 
-const TOKEN = process.env.BOT_TOKEN;
-const DOWNLOAD_API = 'https://eypz.koyeb.app/api/dl?q=';
-const PLAYLIST_API  = 'https://eypz.koyeb.app/api/playlist?url=';
-
 const queues = new Map();
 
-client.once('ready', async () => {
+client.once('ready', () => {
     console.log(`Logged in as ${client.user.tag}`);
-    try {
-        await client.application.commands.set([]);
-        client.guilds.cache.forEach(async (guild) => await guild.commands.set([]));
-        console.log('Slash commands cleared');
-    } catch (err) {
-        console.error('Cleanup error:', err);
-    }
 });
 
-client.on('messageCreate', async (message) => {
-    if (message.author.bot || !message.content) return;
-    const query = message.content.trim();
-    if (query.startsWith('<@') || query.startsWith('/') || query.startsWith('!')) return;
-    if (!query.startsWith('http') && query.length <= 3) return;
-    handlePlayRequest(message, query);
-});
-
-async function handlePlayRequest(message, query) {
-    const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) return message.reply('❌ Join a voice channel first.');
-
-    let queue = queues.get(message.guild.id);
-
-    if (!queue) {
-        queue = {
-            textChannel: message.channel,
-            voiceChannel,
-            connection: null,
-            player: createAudioPlayer(),
-            songs: [],
-            volume: 0.5,
-            nowPlayingMsg: null
-        };
-        queues.set(message.guild.id, queue);
-        setupPlayerListeners(queue, message.guild.id);
-    }
-
-    try {
-        if (query.includes('spotify.com/playlist/')) {
-            const loadingMsg = await message.channel.send('⏳ Loading playlist...');
-            const res = await axios.get(`${PLAYLIST_API}${encodeURIComponent(query)}`, { timeout: 20000 });
-            const tracks = res.data?.result?.tracks;
-            if (!tracks || tracks.length === 0) return loadingMsg.edit('❌ Could not load playlist.');
-            for (const t of tracks) {
-                queue.songs.push({ title: `${t.name} ${t.artist}` });
-            }
-            await loadingMsg.edit({
-                content: null,
-                embeds: [new EmbedBuilder().setDescription(`✅ Added **${tracks.length} tracks** to the queue.`).setColor('#1DB954')]
-            });
-        } else {
-            queue.songs.push({ title: query });
-            if (queue.connection && queue.songs.length > 1) {
-                await message.channel.send({
-                    embeds: [new EmbedBuilder().setDescription(`🎵 Added to queue: \`${query}\``).setColor('#0099FF')]
-                });
-            }
-        }
-
-        if (!queue.connection) {
-            const conn = joinVoiceChannel({
-                channelId: voiceChannel.id,
-                guildId: message.guild.id,
-                adapterCreator: message.guild.voiceAdapterCreator,
-                selfDeaf: false,
-                selfMute: false
-            });
-
-            queue.connection = conn;
-            conn.subscribe(queue.player);
-
-            // Handle unexpected disconnects — try to recover, else clean up
-            conn.on(VoiceConnectionStatus.Disconnected, async () => {
-                try {
-                    await Promise.race([
-                        entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
-                        entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
-                    ]);
-                } catch {
-                    conn.destroy();
-                    queues.delete(message.guild.id);
-                }
-            });
-
-            // Start playback only after connection is Ready — no AbortError, no premature play
-            if (conn.state.status === VoiceConnectionStatus.Ready) {
-                playNext(message.guild.id);
-            } else {
-                conn.once(VoiceConnectionStatus.Ready, () => {
-                    playNext(message.guild.id);
-                });
-            }
-        }
-
-    } catch (err) {
-        console.error('handlePlayRequest error:', err);
-        message.channel.send('❌ Something went wrong.');
-    }
-}
-
-// Fetch fresh track metadata + URL right before playing (URLs expire quickly)
-async function fetchTrackData(title) {
-    try {
-        console.log('Fetching track:', title);
-        const res = await axios.get(`${DOWNLOAD_API}${encodeURIComponent(title)}`, { timeout: 20000 });
-        if (!res.data?.status || !res.data?.result?.url) {
-            console.warn('No result for:', title);
-            return null;
-        }
-        console.log('Got URL:', res.data.result.url);
-        return res.data.result;
-    } catch (err) {
-        console.error('fetchTrackData error:', err.message);
-        return null;
-    }
-}
-
-// Pipe download as stream with full browser headers (server blocks non-browser requests)
-async function fetchAudioStream(url) {
-    const res = await axios.get(url, {
-        responseType: 'stream',
-        timeout: 30000,
-        maxRedirects: 10,
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,video/*;q=0.6,*/*;q=0.5',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.youtube.com/',
-            'Origin': 'https://www.youtube.com',
-            'Range': 'bytes=0-',
-            'Connection': 'keep-alive'
-        }
+async function createStream(url) {
+    const ffmpegProcess = spawn(ffmpeg, [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', url,
+        '-analyzeduration', '0',
+        '-loglevel', '0',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        'pipe:1'
+    ], {
+        stdio: ['ignore', 'pipe', 'ignore']
     });
-    return res.data;
+
+    const opusStream = new prism.opus.Encoder({
+        rate: 48000,
+        channels: 2,
+        frameSize: 960
+    });
+
+    return createAudioResource(
+        ffmpegProcess.stdout.pipe(opusStream),
+        {
+            inputType: StreamType.Opus
+        }
+    );
 }
 
 async function playNext(guildId) {
     const queue = queues.get(guildId);
-    if (!queue || queue.songs.length === 0) {
-        if (queue?.connection) queue.connection.destroy();
+
+    if (!queue) return;
+
+    if (queue.songs.length === 0) {
+        queue.connection.destroy();
         queues.delete(guildId);
         return;
     }
 
-    const song = queue.songs[0];
-    const trackData = await fetchTrackData(song.title);
+    const song = queue.songs.shift();
 
-    if (!trackData) {
-        console.warn('Skipping, no track data:', song.title);
-        queue.songs.shift();
-        return playNext(guildId);
-    }
-
-    let resource;
     try {
-        const audioStream = await fetchAudioStream(trackData.url);
-        resource = createAudioResource(audioStream, {
-            inputType: StreamType.Arbitrary,
-            inlineVolume: true
+        const resource = await createStream(song.url);
+
+        queue.player.play(resource);
+
+        const embed = new EmbedBuilder()
+            .setTitle('Now Playing')
+            .setDescription(`**${song.title}**`)
+            .setThumbnail(song.thumbnail || null);
+
+        queue.textChannel.send({
+            embeds: [embed]
         });
-        resource.volume.setVolume(queue.volume);
+
     } catch (err) {
-        console.error('Stream error for', song.title, ':', err.message);
-        queue.songs.shift();
-        return playNext(guildId);
+        console.error(err);
+        playNext(guildId);
     }
+}
 
-    queue.player.play(resource);
-
-    // Delete old embed (prevents playlist spam)
-    if (queue.nowPlayingMsg) {
-        try { await queue.nowPlayingMsg.delete(); } catch (_) {}
-        queue.nowPlayingMsg = null;
-    }
-
-    const durationSec = Math.floor(trackData.duration || 0);
-    const durationStr = durationSec > 0
-        ? `${Math.floor(durationSec / 60)}:${String(durationSec % 60).padStart(2, '0')}`
-        : 'Unknown';
-
-    const remaining = queue.songs.length - 1;
-    const queueStr = remaining > 0 ? `${remaining} song(s) remaining` : 'Last song';
-
-    const embed = new EmbedBuilder()
-        .setTitle('🎵 Now Playing')
-        .setDescription(`**${trackData.title || song.title}**`)
-        .setColor('#0099FF')
-        .addFields(
-            { name: '⏱ Duration', value: durationStr, inline: true },
-            { name: '📋 Queue',    value: queueStr,    inline: true }
-        );
-
-    if (trackData.thumbnail) embed.setThumbnail(trackData.thumbnail);
-
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('pause').setLabel('⏸ Pause').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('skip').setLabel('⏭ Skip').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('stop').setLabel('⏹ Stop').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId('vol_up').setLabel('🔊+').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('vol_down').setLabel('🔉-').setStyle(ButtonStyle.Success)
-    );
-
+client.on('messageCreate', async (message) => {
     try {
-        const msg = await queue.textChannel.send({ embeds: [embed], components: [row] });
-        queue.nowPlayingMsg = msg;
-        setupCollector(msg, queue, guildId);
-    } catch (err) {
-        console.error('Failed to send embed:', err);
-    }
-}
+        if (message.author.bot) return;
+        if (!message.content.startsWith(PREFIX)) return;
 
-function setupPlayerListeners(queue, guildId) {
-    queue.player.on(AudioPlayerStatus.Idle, () => {
-        queue.songs.shift();
-        playNext(guildId);
-    });
+        const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+        const command = args.shift()?.toLowerCase();
 
-    queue.player.on('error', (error) => {
-        console.error('Player error:', error.message);
-        queue.songs.shift();
-        playNext(guildId);
-    });
-}
+        if (command === 'play') {
+            const query = args.join(' ');
 
-function setupCollector(message, queue, guildId) {
-    const collector = message.createMessageComponentCollector({
-        componentType: ComponentType.Button,
-        time: 600_000
-    });
+            if (!query) {
+                return message.reply('Provide a song name');
+            }
 
-    collector.on('collect', async (i) => {
-        switch (i.customId) {
-            case 'pause':
-                if (queue.player.state.status === AudioPlayerStatus.Playing) {
-                    queue.player.pause();
-                    await i.reply({ content: '⏸ Paused.', flags: 64 });
-                } else {
-                    queue.player.unpause();
-                    await i.reply({ content: '▶️ Resumed.', flags: 64 });
-                }
-                break;
+            const voiceChannel = message.member.voice.channel;
 
-            case 'skip':
-                queue.player.stop();
-                await i.reply({ content: '⏭ Skipped.', flags: 64 });
-                break;
+            if (!voiceChannel) {
+                return message.reply('Join a voice channel first');
+            }
 
-            case 'stop':
-                queue.songs = [];
-                queue.player.stop();
-                queue.connection?.destroy();
-                queues.delete(guildId);
-                await i.reply({ content: '⏹ Stopped and disconnected.', flags: 64 });
-                collector.stop();
-                break;
+            const msg = await message.reply('Searching...');
 
-            case 'vol_up':
-                queue.volume = Math.min(queue.volume + 0.1, 1);
-                queue.player.state.resource?.volume?.setVolume(queue.volume);
-                await i.reply({ content: `🔊 Volume: **${Math.round(queue.volume * 100)}%**`, flags: 64 });
-                break;
+            const api = `https://song-dl-0q80.onrender.com/api/dl?q=${encodeURIComponent(query)}`;
 
-            case 'vol_down':
-                queue.volume = Math.max(queue.volume - 0.1, 0);
-                queue.player.state.resource?.volume?.setVolume(queue.volume);
-                await i.reply({ content: `🔉 Volume: **${Math.round(queue.volume * 100)}%**`, flags: 64 });
-                break;
+            const { data } = await axios.get(api);
+
+            if (!data?.status || !data?.result?.url) {
+                return msg.edit('Song not found');
+            }
+
+            const song = data.result;
+
+            let queue = queues.get(message.guild.id);
+
+            if (!queue) {
+                const connection = joinVoiceChannel({
+                    channelId: voiceChannel.id,
+                    guildId: voiceChannel.guild.id,
+                    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                    selfDeaf: false
+                });
+
+                await entersState(
+                    connection,
+                    VoiceConnectionStatus.Ready,
+                    30000
+                );
+
+                const player = createAudioPlayer();
+
+                connection.subscribe(player);
+
+                queue = {
+                    textChannel: message.channel,
+                    voiceChannel,
+                    connection,
+                    player,
+                    songs: []
+                };
+
+                queues.set(message.guild.id, queue);
+
+                player.on(AudioPlayerStatus.Idle, () => {
+                    playNext(message.guild.id);
+                });
+
+                player.on('error', (err) => {
+                    console.error(err);
+                    playNext(message.guild.id);
+                });
+            }
+
+            queue.songs.push({
+                title: song.title,
+                url: song.url,
+                thumbnail: song.thumbnail
+            });
+
+            msg.edit(`Added to queue: ${song.title}`);
+
+            if (queue.player.state.status !== AudioPlayerStatus.Playing) {
+                playNext(message.guild.id);
+            }
         }
-    });
 
-    collector.on('end', () => {
-        message.edit({ components: [] }).catch(() => {});
-    });
-}
+        else if (command === 'playlist') {
+            const url = args[0];
 
-client.login(TOKEN);
+            if (!url) {
+                return message.reply('Provide Spotify playlist URL');
+            }
+
+            const voiceChannel = message.member.voice.channel;
+
+            if (!voiceChannel) {
+                return message.reply('Join a voice channel first');
+            }
+
+            const msg = await message.reply('Fetching playlist...');
+
+            const api = `https://song-dl-0q80.onrender.com/api/playlist?url=${encodeURIComponent(url)}`;
+
+            const { data } = await axios.get(api);
+
+            if (!data?.status || !data?.result?.tracks?.length) {
+                return msg.edit('Playlist not found');
+            }
+
+            const playlist = data.result;
+
+            let queue = queues.get(message.guild.id);
+
+            if (!queue) {
+                const connection = joinVoiceChannel({
+                    channelId: voiceChannel.id,
+                    guildId: voiceChannel.guild.id,
+                    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                    selfDeaf: false
+                });
+
+                await entersState(
+                    connection,
+                    VoiceConnectionStatus.Ready,
+                    30000
+                );
+
+                const player = createAudioPlayer();
+
+                connection.subscribe(player);
+
+                queue = {
+                    textChannel: message.channel,
+                    voiceChannel,
+                    connection,
+                    player,
+                    songs: []
+                };
+
+                queues.set(message.guild.id, queue);
+
+                player.on(AudioPlayerStatus.Idle, () => {
+                    playNext(message.guild.id);
+                });
+
+                player.on('error', (err) => {
+                    console.error(err);
+                    playNext(message.guild.id);
+                });
+            }
+
+            msg.edit(`Adding ${playlist.tracks.length} songs...`);
+
+            for (const track of playlist.tracks) {
+                try {
+                    const search = `${track.name} ${track.artist}`;
+
+                    const dl = await axios.get(
+                        `https://eypz.koyeb.app/api/dl?q=${encodeURIComponent(search)}`
+                    );
+
+                    if (
+                        dl.data?.status &&
+                        dl.data?.result?.url
+                    ) {
+                        queue.songs.push({
+                            title: dl.data.result.title,
+                            url: dl.data.result.url,
+                            thumbnail: dl.data.result.thumbnail
+                        });
+                    }
+
+                } catch (e) {
+                    console.log(e);
+                }
+            }
+
+            msg.edit(
+                `Playlist Added\nName: ${playlist.info.name}\nTracks: ${playlist.tracks.length}`
+            );
+
+            if (queue.player.state.status !== AudioPlayerStatus.Playing) {
+                playNext(message.guild.id);
+            }
+        }
+
+        else if (command === 'skip') {
+            const queue = queues.get(message.guild.id);
+
+            if (!queue) {
+                return message.reply('No queue');
+            }
+
+            queue.player.stop();
+
+            message.reply('Skipped');
+        }
+
+        else if (command === 'queue') {
+            const queue = queues.get(message.guild.id);
+
+            if (!queue || queue.songs.length === 0) {
+                return message.reply('Queue empty');
+            }
+
+            const songs = queue.songs
+                .slice(0, 10)
+                .map((s, i) => `${i + 1}. ${s.title}`)
+                .join('\n');
+
+            message.reply(songs);
+        }
+
+        else if (command === 'stop') {
+            const queue = queues.get(message.guild.id);
+
+            if (!queue) {
+                return message.reply('Nothing playing');
+            }
+
+            queue.songs = [];
+
+            queue.player.stop();
+
+            queue.connection.destroy();
+
+            queues.delete(message.guild.id);
+
+            message.reply('Stopped');
+        }
+
+    } catch (err) {
+        console.error(err);
+
+        try {
+            message.reply('Error occurred');
+        } catch {}
+    }
+});
+
+client.login(process.env.BOT_TOKEN);

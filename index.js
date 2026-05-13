@@ -12,22 +12,20 @@ const {
     createAudioPlayer, 
     createAudioResource, 
     AudioPlayerStatus,
+    VoiceConnectionStatus,
     entersState,
-    VoiceConnectionStatus
+    StreamType
 } = require('@discordjs/voice');
 const axios = require('axios');
-require('dotenv').config();
 const http = require('http');
+require('dotenv').config();
 
-// 1. KEEP-ALIVE SERVER FOR RENDER
-// This prevents Render from timing out or erroring due to no bound port
+// --- RENDER KEEP-ALIVE ---
 const PORT = process.env.PORT || 10000;
 http.createServer((req, res) => {
     res.writeHead(200);
-    res.end('Bot is running');
-}).listen(PORT, () => {
-    console.log(`Keep-alive server listening on port ${PORT}`);
-});
+    res.end('Music Bot is Online');
+}).listen(PORT);
 
 const client = new Client({
     intents: [
@@ -38,27 +36,32 @@ const client = new Client({
     ]
 });
 
+// Settings
 const TOKEN = process.env.BOT_TOKEN;
 const DOWNLOAD_API = 'https://eypz.koyeb.app/api/dl?q=';
 const PLAYLIST_API = 'https://eypz.koyeb.app/api/playlist?url=';
 
 const queues = new Map();
 
+// --- STARTUP LOGIC ---
 client.once('ready', async () => {
+    console.log('Bot logged in');
     try {
-        console.log('Bot is online');
+        // Clean up all slash commands
         await client.application.commands.set([]);
         client.guilds.cache.forEach(async (guild) => {
             await guild.commands.set([]);
         });
-        console.log('Command cleanup complete');
+        console.log('Global and Guild commands cleared');
     } catch (error) {
-        console.error('Error during startup:', error);
+        console.error('Cleanup error:', error);
     }
 });
 
+// --- MESSAGE HANDLER ---
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.content) return;
+
     const query = message.content.trim();
     if (query.startsWith('http') || query.length > 2) {
         handlePlayRequest(message, query);
@@ -67,7 +70,7 @@ client.on('messageCreate', async (message) => {
 
 async function handlePlayRequest(message, query) {
     const voiceChannel = message.member?.voice.channel;
-    if (!voiceChannel) return message.reply('You must be in a voice channel');
+    if (!voiceChannel) return message.reply('Join a voice channel first');
 
     let queue = queues.get(message.guild.id);
 
@@ -79,7 +82,6 @@ async function handlePlayRequest(message, query) {
             player: createAudioPlayer(),
             songs: [],
             volume: 0.5,
-            playing: true,
             prefetchedNext: null
         };
         queues.set(message.guild.id, queue);
@@ -91,7 +93,7 @@ async function handlePlayRequest(message, query) {
             const res = await axios.get(`${PLAYLIST_API}${encodeURIComponent(query)}`);
             const tracks = res.data.result.tracks;
             tracks.forEach(t => queue.songs.push({ title: `${t.name} ${t.artist}`, url: t.share_url }));
-            message.channel.send({ embeds: [new EmbedBuilder().setDescription(`Added ${tracks.length} tracks`).setColor('#00FF00')] });
+            message.channel.send({ embeds: [new EmbedBuilder().setDescription(`Loaded ${tracks.length} tracks`).setColor('#00FF00')] });
         } else {
             queue.songs.push({ title: query, url: query });
         }
@@ -101,23 +103,21 @@ async function handlePlayRequest(message, query) {
                 channelId: voiceChannel.id,
                 guildId: message.guild.id,
                 adapterCreator: message.guild.voiceAdapterCreator,
-                selfDeaf: true // Optimization
+                selfDeaf: true,
+                selfMute: false
             });
 
-            // 2. CONNECTION FIX
-            // Ensure connection is ready before subscribing
             try {
                 await entersState(queue.connection, VoiceConnectionStatus.Ready, 20_000);
                 queue.connection.subscribe(queue.player);
                 playNext(message.guild.id);
             } catch (err) {
-                console.error('Failed to join voice:', err);
                 queue.connection.destroy();
                 queues.delete(message.guild.id);
             }
         }
     } catch (error) {
-        console.error(error);
+        console.error('Play error:', error);
     }
 }
 
@@ -146,16 +146,14 @@ async function playNext(guildId) {
         return playNext(guildId);
     }
 
-    // 3. RESOURCE HANDLING
-    // The library sometimes needs a fresh resource to trigger playback properly
+    // Direct Download URL Fix: Using StreamType.Arbitrary to force FFmpeg processing
     const resource = createAudioResource(trackData.url, { 
         inlineVolume: true,
-        inputType: 0 // Explicitly set to Arbitrary for stream URLs
+        inputType: StreamType.Arbitrary 
     });
     
     resource.volume.setVolume(queue.volume);
     queue.player.play(resource);
-    queue.currentResource = resource;
 
     const embed = new EmbedBuilder()
         .setTitle('Now Playing')
@@ -174,6 +172,7 @@ async function playNext(guildId) {
 
     const msg = await queue.textChannel.send({ embeds: [embed], components: [row] });
 
+    // Gapless pre-fetch: 30 seconds before track ends
     const preFetchDelay = (trackData.duration - 30) * 1000;
     if (preFetchDelay > 0) {
         setTimeout(async () => {
@@ -193,7 +192,7 @@ function setupPlayerListeners(queue, guildId) {
     });
 
     queue.player.on('error', error => {
-        console.error(`Player Error: ${error.message}`);
+        console.error('Player error:', error.message);
         queue.songs.shift();
         playNext(guildId);
     });
@@ -206,27 +205,27 @@ function setupCollector(message, queue, guildId) {
         if (i.customId === 'pause') {
             if (queue.player.state.status === AudioPlayerStatus.Playing) {
                 queue.player.pause();
-                await i.reply({ content: 'Paused', ephemeral: true });
+                await i.reply({ content: 'Playback paused', ephemeral: true });
             } else {
                 queue.player.unpause();
-                await i.reply({ content: 'Resumed', ephemeral: true });
+                await i.reply({ content: 'Playback resumed', ephemeral: true });
             }
         } else if (i.customId === 'skip') {
             queue.player.stop();
-            await i.reply({ content: 'Skipped', ephemeral: true });
+            await i.reply({ content: 'Skipping track', ephemeral: true });
         } else if (i.customId === 'stop') {
             queue.songs = [];
             queue.player.stop();
             queue.connection.destroy();
             queues.delete(guildId);
-            await i.reply({ content: 'Stopped', ephemeral: true });
+            await i.reply({ content: 'Stopped and disconnected', ephemeral: true });
         } else if (i.customId === 'vol_up') {
             queue.volume = Math.min(queue.volume + 0.1, 1);
-            queue.currentResource?.volume.setVolume(queue.volume);
+            queue.player.state.resource?.volume?.setVolume(queue.volume);
             await i.reply({ content: `Volume: ${Math.round(queue.volume * 100)}%`, ephemeral: true });
         } else if (i.customId === 'vol_down') {
             queue.volume = Math.max(queue.volume - 0.1, 0);
-            queue.currentResource?.volume.setVolume(queue.volume);
+            queue.player.state.resource?.volume?.setVolume(queue.volume);
             await i.reply({ content: `Volume: ${Math.round(queue.volume * 100)}%`, ephemeral: true });
         }
     });

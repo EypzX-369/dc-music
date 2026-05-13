@@ -135,20 +135,28 @@ async function handlePlayRequest(message, query) {
                 channelId: voiceChannel.id,
                 guildId: message.guild.id,
                 adapterCreator: message.guild.voiceAdapterCreator,
-                selfDeaf: false,   // FIX: was true — caused deafen issue
+                selfDeaf: false,
                 selfMute: false
             });
 
-            try {
-                await entersState(queue.connection, VoiceConnectionStatus.Ready, 20_000);
-                queue.connection.subscribe(queue.player);
-                await playNext(message.guild.id);
-            } catch (err) {
-                console.error('Voice connection error:', err);
-                queue.connection.destroy();
-                queues.delete(message.guild.id);
-                message.channel.send('❌ Failed to join voice channel.');
+            // If already Ready (joined instantly), skip entersState entirely
+            if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
+                try {
+                    await entersState(queue.connection, VoiceConnectionStatus.Ready, 30_000);
+                } catch (err) {
+                    console.error('Voice connection error:', err);
+                    // Only destroy if still not ready — sometimes it joins fine despite the timeout
+                    if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
+                        queue.connection.destroy();
+                        queues.delete(message.guild.id);
+                        message.channel.send('❌ Could not connect to voice channel.');
+                        return;
+                    }
+                }
             }
+
+            queue.connection.subscribe(queue.player);
+            await playNext(message.guild.id);
         }
 
     } catch (error) {
